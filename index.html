@@ -1101,20 +1101,22 @@ async function saveSettings() {
   ghConfig.owner = $('gh-owner-input').value.trim();
   ghConfig.repo = $('gh-repo-input').value.trim();
   ghRepoInfo = null; /* 仓库信息可能变化，重新获取 */
-  if (tokenChanged) {
-    ghConfig.token = newToken;
-    try {
-      await tryLogin();
-    } catch (e) {
-      flash('GitHub 连接失败：' + e.message, 'error');
-      return; /* 保持对话框打开，便于修改 */
-    }
-  }
+  if (tokenChanged) ghConfig.token = newToken;
+  /* 先保存本地配置，保证「保存」一定生效（不因网络问题被中断） */
   saveGhConfig();
   updateAuthUI();
   applySettings();
   $('settings-dialog').close();
   var msg = '设置已保存';
+  if (ghConfig.token) {
+    try {
+      await tryLogin();
+      updateAuthUI();
+    } catch (e) {
+      flash('设置已保存，但 Token 验证失败（' + friendlyGitHubError(e) + '）。请更换代理节点或稍后重试，Token 无需花钱', 'error');
+      return;
+    }
+  }
   if (ghUser) {
     try {
       await publishAll('更新站点设置');
@@ -1122,7 +1124,6 @@ async function saveSettings() {
     } catch (e) {
       msg = '设置已保存，但同步到 GitHub 失败：' + friendlyGitHubError(e);
     }
-    await loadCloud();
   }
   flash(msg);
 }
