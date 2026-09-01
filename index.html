@@ -358,7 +358,8 @@ var flashTimer = null;
 function $(id) { return document.getElementById(id); }
 
 /* ================= GitHub API 封装 ================= */
-function ghApi(path, opts, tokenOverride) {
+/* 网络错误自动重试 2 次（间隔 1s / 2s），HTTP 业务错误不重试 */
+function ghApi(path, opts, tokenOverride, retryLeft) {
   var token = tokenOverride || ghConfig.token;
   var headers = {
     'Accept': 'application/vnd.github+json',
@@ -384,7 +385,12 @@ function ghApi(path, opts, tokenOverride) {
     if (e && e.name === 'AbortError') {
       throw new Error('连接 GitHub 超时，请检查网络后重试');
     }
-    throw new Error('无法连接 GitHub 服务器（网络错误），请检查网络或代理设置后重试');
+    var left = (typeof retryLeft === 'number') ? retryLeft : 2;
+    if (left > 0) {
+      return new Promise(function (res) { setTimeout(res, 1000 * (3 - left)); })
+        .then(function () { return ghApi(path, opts, tokenOverride, left - 1); });
+    }
+    throw new Error('无法连接 GitHub 服务器（网络错误）。排查：① 用浏览器直接打开 https://api.github.com 看能否访问；② 若打不开，说明 api.github.com 未走代理，请在代理软件中为 api.github.com 添加分流规则或临时切换全局代理；③ 稍后重试');
   }).finally(function () {
     if (timer) clearTimeout(timer);
   });
