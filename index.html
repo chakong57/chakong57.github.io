@@ -366,6 +366,10 @@ function ghApi(path, opts, tokenOverride) {
   };
   if (token) headers.Authorization = 'Bearer ' + token;
   var init = Object.assign({ headers: headers }, opts);
+  /* 20 秒超时，避免网络异常时长时间挂起 */
+  var ctrl = ('AbortController' in window) ? new AbortController() : null;
+  if (ctrl) init.signal = ctrl.signal;
+  var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, 20000) : null;
   return fetch('https://api.github.com' + path, init).then(function (res) {
     return res.json().catch(function () { return {}; }).then(function (data) {
       if (!res.ok) {
@@ -375,6 +379,14 @@ function ghApi(path, opts, tokenOverride) {
       }
       return data;
     });
+  }).catch(function (e) {
+    if (e && e.status) throw e; /* HTTP 业务错误原样抛出 */
+    if (e && e.name === 'AbortError') {
+      throw new Error('连接 GitHub 超时，请检查网络后重试');
+    }
+    throw new Error('无法连接 GitHub 服务器（网络错误），请检查网络或代理设置后重试');
+  }).finally(function () {
+    if (timer) clearTimeout(timer);
   });
 }
 
