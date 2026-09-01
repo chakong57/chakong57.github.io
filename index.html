@@ -183,13 +183,13 @@ dialog::backdrop{background:rgba(31,35,40,.5)}
     <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M7.75 2a.75.75 0 0 1 .75.75V7h4.25a.75.75 0 0 1 0 1.5H8.5v4.25a.75.75 0 0 1-1.5 0V8.5H2.75a.75.75 0 0 1 0-1.5H7V2.75A.75.75 0 0 1 7.75 2Z"/></svg>
     写文章
   </button>
-  <button id="btn-login" class="btn" onclick="openSettings()">管理员登录</button>
+  <button id="btn-login" class="btn" onclick="openPwdDialog()">管理员登录</button>
   <div id="user-area" class="user-area" hidden>
     <img id="user-avatar" class="avatar" alt="头像">
     <span id="user-name"></span>
     <button class="btn btn-sm" onclick="logout()" title="退出管理员登录">退出</button>
   </div>
-  <button class="btn" onclick="openSettings()">设置</button>
+  <button id="btn-settings" class="btn" onclick="openSettings()" hidden>设置</button>
 </header>
 
 <main class="container">
@@ -267,6 +267,20 @@ dialog::backdrop{background:rgba(31,35,40,.5)}
 
 </main>
 
+<!-- ===== 管理员密码验证弹窗 ===== -->
+<dialog id="pwd-dialog">
+  <div class="dialog-header">管理员验证<span class="dialog-close" onclick="closePwdDialog()" title="关闭">✕</span></div>
+  <div class="dialog-body">
+    <label class="field-label" for="pwd-input">管理员密码</label>
+    <input id="pwd-input" class="input" type="password" placeholder="请输入管理员密码" autocomplete="off" onkeydown="if(event.key==='Enter')checkPassword()">
+    <p class="hint" id="pwd-error" style="color:var(--danger);display:none">密码错误，请重试</p>
+    <div class="dialog-actions">
+      <button class="btn" onclick="closePwdDialog()">取消</button>
+      <button class="btn btn-primary" onclick="checkPassword()">进入</button>
+    </div>
+  </div>
+</dialog>
+
 <!-- ===== 设置弹窗 ===== -->
 <dialog id="settings-dialog">
   <div class="dialog-header">设置<span class="dialog-close" onclick="document.getElementById('settings-dialog').close()" title="关闭">✕</span></div>
@@ -277,13 +291,12 @@ dialog::backdrop{background:rgba(31,35,40,.5)}
       <input id="gh-owner-input" class="input" placeholder="GitHub 用户名，如 xcom57" autocomplete="off">
       <input id="gh-repo-input" class="input" placeholder="仓库名，如 xcom57.github.io" autocomplete="off">
       <input id="gh-token-input" class="input" type="password" placeholder="Personal Access Token（Contents 读写权限）" autocomplete="off">
-      <input id="gh-admins-input" class="input" placeholder="允许的管理员用户名（可选，多个用逗号分隔）" autocomplete="off">
       <div class="gh-status neutral" id="gh-status">未连接</div>
       <div class="dialog-actions" style="justify-content:flex-start">
         <button class="btn btn-sm" id="btn-test-conn" onclick="testConnection()">测试连接</button>
       </div>
-      <p class="hint">Token 创建：GitHub → Settings → Developer settings → Personal access tokens → 选择 Fine-grained，仅授权本博客仓库，权限勾选 Contents: Read and write。<br>
-      Token 只保存在「当前浏览器」中，游客访问时看不到、也用不了；请勿把 Token 告诉任何人，泄露等于交出仓库写权限。</p>
+      <p class="hint">此设置页受管理员密码保护。Token 创建：GitHub → Settings → Developer settings → Personal access tokens → 选择 Fine-grained，仅授权本博客仓库，权限勾选 Contents: Read and write。<br>
+      Token 只保存在「当前浏览器」中，游客看不到也用不了；请勿泄露，泄露等于交出仓库写权限。</p>
     </div>
 
     <div class="dialog-section">
@@ -329,8 +342,11 @@ var LEGACY_SETTINGS_KEY = 'xcom57blog:settings:v1';
 
 var posts = [];              /* 云端文章列表 */
 var settings = { title: 'My Blog', desc: '' };
-var ghConfig = { owner: '', repo: '', token: '', admins: '' };
+var ghConfig = { owner: '', repo: '', token: '' };
 var ghUser = null;           /* 已登录的管理员 {login, avatar_url, name} */
+var unlocked = false;        /* 管理员密码是否验证通过 */
+var UNLOCK_KEY = 'xcom57blog:unlock:v1';
+var ADMIN_PASSWORD_HASH = '6b9b7475b10146c71fd08f21ae181fd2a53d48d67d16090345eba2e548cebefa'; /* 管理员密码 SHA-256（明文不存于页面） */
 var editingId = null;        /* 正在编辑的文章 id */
 var currentPostId = null;    /* 当前查看的文章 id */
 var cloudState = 'loading';  /* loading | ok | error */
@@ -376,34 +392,32 @@ function loadLegacySettingsDefaults() {
   } catch (e) { /* 忽略 */ }
 }
 
-function parseAdmins(str) {
-  return String(str || '').split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
+/* 是否为管理员：密码已验证 且 Token 验证通过 */
+function isAdmin() {
+  return unlocked && !!ghUser;
 }
 
-/* 用当前 token 验证管理员身份（含白名单检查） */
+/* 用当前 token 验证身份 */
 async function tryLogin() {
   ghUser = null;
   if (!ghConfig.token) return;
-  var u = await ghApi('/user');
-  var admins = parseAdmins(ghConfig.admins);
-  if (admins.length && admins.indexOf(u.login) === -1) {
-    throw new Error('当前账号 @' + u.login + ' 不在管理员名单中');
-  }
-  ghUser = u;
+  ghUser = await ghApi('/user');
 }
 
 function updateAuthUI() {
-  var logged = !!ghUser;
-  $('btn-write').hidden = !logged;
-  $('btn-login').hidden = logged;
-  $('user-area').hidden = !logged;
-  if (logged) {
+  $('btn-write').hidden = !isAdmin();
+  $('btn-login').hidden = unlocked;
+  $('btn-settings').hidden = !unlocked;
+  $('user-area').hidden = !ghUser;
+  if (ghUser) {
     $('user-avatar').src = ghUser.avatar_url;
     $('user-name').textContent = ghUser.login;
   }
 }
 
 function logout() {
+  localStorage.removeItem(UNLOCK_KEY);
+  unlocked = false;
   ghConfig.token = '';
   saveGhConfig();
   ghUser = null;
@@ -502,7 +516,7 @@ function renderHome() {
     var emptyText, emptyAction = '';
     if (cloudState === 'error') {
       emptyText = q ? '没有找到相关文章' : '无法连接云端';
-      emptyAction = '<p>' + (q ? '换个关键词试试' : '请检查网络，或由管理员在「设置」中配置 GitHub 连接后刷新') + '</p>';
+      emptyAction = '<p>' + (q ? '换个关键词试试' : '请检查网络后刷新，或联系管理员') + '</p>';
     } else {
       emptyText = '还没有文章';
       emptyAction = '<p>等待管理员发布第一篇文章</p>';
@@ -530,9 +544,9 @@ function renderHome() {
 
 /* ================= 编辑器（仅管理员） ================= */
 function openEditor(id) {
-  if (!ghUser) {
-    flash('请先以管理员身份登录后才能写文章', 'error');
-    openSettings();
+  if (!isAdmin()) {
+    flash('请先输入管理员密码并配置 Token', 'error');
+    openPwdDialog();
     return;
   }
   editingId = id || null;
@@ -576,7 +590,7 @@ function wrapSelection(before, after, placeholder) {
 }
 
 async function savePost() {
-  if (!ghUser) { flash('请先以管理员身份登录', 'error'); return; }
+  if (!isAdmin()) { flash('请先以管理员身份登录', 'error'); return; }
   var title = $('editor-title-input').value.trim();
   var body = $('editor-body').value;
   var tags = $('editor-tags-input').value.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
@@ -625,14 +639,14 @@ function openPost(id) {
     : '';
   $('post-body').innerHTML = mdToHtml(p.body);
   /* 编辑 / 删除按钮仅管理员可见 */
-  $('btn-edit-post').hidden = !ghUser;
-  $('btn-del-post').hidden = !ghUser;
+  $('btn-edit-post').hidden = !isAdmin();
+  $('btn-del-post').hidden = !isAdmin();
   showView('post');
   window.scrollTo(0, 0);
 }
 
 async function deletePost(id) {
-  if (!ghUser) { flash('请先以管理员身份登录', 'error'); return; }
+  if (!isAdmin()) { flash('请先以管理员身份登录', 'error'); return; }
   var p = posts.find(function (x) { return x.id === id; });
   if (!p) return;
   if (!confirm('确定删除《' + p.title + '》吗？此操作将同步删除 GitHub 上的文章，不可恢复。')) return;
@@ -654,8 +668,9 @@ function handleImageInput(input) {
 }
 
 async function handleFiles(files) {
-  if (!ghUser) {
+  if (!isAdmin()) {
     flash('请先以管理员身份登录后才能上传图片', 'error');
+    openPwdDialog();
     return;
   }
   if (!files || !files.length) return;
@@ -809,7 +824,7 @@ async function migrateLegacy() {
   try { legacy = JSON.parse(localStorage.getItem(LEGACY_POSTS_KEY)) || []; }
   catch (e) { legacy = []; }
   if (!Array.isArray(legacy) || !legacy.length) { flash('没有可迁移的本地文章', 'error'); return; }
-  if (!ghUser) { flash('请先登录管理员', 'error'); return; }
+  if (!isAdmin()) { flash('请先以管理员身份登录', 'error'); return; }
   var ids = {};
   posts.forEach(function (p) { ids[p.id] = 1; });
   var added = legacy.filter(function (p) { return !ids[p.id]; });
@@ -824,12 +839,107 @@ async function migrateLegacy() {
   }
 }
 
+/* ================= 管理员密码锁 ================= */
+/* 纯 JS SHA-256（无依赖，任何环境下可用；密码仅以哈希形式存在于页面） */
+function sha256hex(ascii) {
+  function rightRotate(v, a) { return (v >>> a) | (v << (32 - a)); }
+  var maxWord = Math.pow(2, 32), i, j, result = '';
+  var words = [], asciiBitLength = ascii.length * 8;
+  var hash = sha256hex.h = sha256hex.h || [];
+  var k = sha256hex.k = sha256hex.k || [];
+  var primeCounter = k.length;
+  var isComposite = {};
+  for (var candidate = 2; primeCounter < 64; candidate++) {
+    if (!isComposite[candidate]) {
+      for (i = 0; i < 313; i += candidate) isComposite[i] = candidate;
+      hash[primeCounter] = (Math.pow(candidate, .5) * maxWord) | 0;
+      k[primeCounter++] = (Math.pow(candidate, 1 / 3) * maxWord) | 0;
+    }
+  }
+  ascii += '\x80';
+  while (ascii.length % 64 - 56) ascii += '\x00';
+  for (i = 0; i < ascii.length; i++) {
+    j = ascii.charCodeAt(i);
+    if (j >> 8) return ''; /* 仅支持 ASCII 输入 */
+    words[i >> 2] |= j << ((3 - i) % 4) * 8;
+  }
+  words[words.length] = ((asciiBitLength / maxWord) | 0);
+  words[words.length] = (asciiBitLength);
+  for (j = 0; j < words.length;) {
+    var w = words.slice(j, j += 16);
+    var oldHash = hash.slice(0, 8);
+    for (i = 0; i < 64; i++) {
+      var w15 = w[i - 15], w2 = w[i - 2];
+      var a = hash[0], e = hash[4];
+      var temp1 = hash[7]
+        + (rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25))
+        + ((e & hash[5]) ^ ((~e) & hash[6]))
+        + k[i]
+        + (w[i] = (i < 16) ? w[i] : (
+            w[i - 16]
+            + (rightRotate(w15, 7) ^ rightRotate(w15, 18) ^ (w15 >>> 3))
+            + w[i - 7]
+            + (rightRotate(w2, 17) ^ rightRotate(w2, 19) ^ (w2 >>> 10))
+          ) | 0);
+      var temp2 = (rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22))
+        + ((a & hash[1]) ^ (a & hash[2]) ^ (hash[1] & hash[2]));
+      hash = [(temp1 + temp2) | 0].concat(hash);
+      hash[4] = (hash[4] + temp1) | 0;
+    }
+    for (i = 0; i < 8; i++) {
+      hash[i] = (hash[i] + oldHash[i]) | 0;
+    }
+  }
+  for (i = 0; i < 8; i++) {
+    for (j = 3; j + 1; j--) {
+      var b = (hash[i] >> (j * 8)) & 255;
+      result += ((b < 16) ? 0 : '') + b.toString(16);
+    }
+  }
+  return result;
+}
+
+function openPwdDialog() {
+  $('pwd-error').style.display = 'none';
+  $('pwd-input').value = '';
+  $('pwd-dialog').showModal();
+  setTimeout(function () { $('pwd-input').focus(); }, 50);
+}
+
+function closePwdDialog() {
+  var d = $('pwd-dialog');
+  if (d.open) d.close();
+}
+
+async function checkPassword() {
+  var v = $('pwd-input').value;
+  if (!v) return;
+  var hash = sha256hex(v);
+  if (hash === ADMIN_PASSWORD_HASH) {
+    localStorage.setItem(UNLOCK_KEY, '1');
+    unlocked = true;
+    $('pwd-error').style.display = 'none';
+    closePwdDialog();
+    if (ghConfig.token) {
+      try { await tryLogin(); }
+      catch (e) { ghUser = null; flash('Token 已失效，请在设置中重新填写', 'error'); }
+    }
+    updateAuthUI();
+    flash('已解锁管理员权限');
+    openSettings(); /* 解锁后直接进入设置页填写 Token */
+  } else {
+    $('pwd-error').style.display = 'block';
+    $('pwd-input').value = '';
+    $('pwd-input').focus();
+  }
+}
+
 /* ================= 设置弹窗 ================= */
 function openSettings() {
+  if (!unlocked) { openPwdDialog(); return; }
   $('gh-owner-input').value = ghConfig.owner;
   $('gh-repo-input').value = ghConfig.repo;
   $('gh-token-input').value = ghConfig.token;
-  $('gh-admins-input').value = ghConfig.admins;
   $('set-title').value = settings.title;
   $('set-desc').value = settings.desc;
   var st = $('gh-status');
@@ -838,14 +948,14 @@ function openSettings() {
     st.textContent = '已连接：' + (ghUser.name || ghUser.login) + '（@' + ghUser.login + '）';
   } else if (ghConfig.token) {
     st.className = 'gh-status error';
-    st.textContent = 'Token 验证失败或账号不在管理员名单中';
+    st.textContent = 'Token 验证失败，请重新填写';
   } else {
     st.className = 'gh-status neutral';
-    st.textContent = '未连接（游客只能浏览，无法发布文章）';
+    st.textContent = '未配置 Token（游客只能浏览，无法发布文章）';
   }
   var n = legacyCount();
   var mb = $('btn-migrate');
-  if (n > 0 && ghUser) {
+  if (n > 0 && isAdmin()) {
     mb.hidden = false;
     mb.textContent = '迁移旧版本地文章（' + n + ' 篇）到 GitHub';
   } else {
@@ -862,18 +972,13 @@ function setGhStatus(text, kind) {
 
 async function testConnection() {
   var token = $('gh-token-input').value.trim();
-  var admins = parseAdmins($('gh-admins-input').value);
   var btn = $('btn-test-conn');
   if (!token) { setGhStatus('请输入 Token', 'error'); return; }
   btn.disabled = true;
   btn.textContent = '测试中…';
   try {
     var u = await ghApi('/user', {}, token);
-    if (admins.length && admins.indexOf(u.login) === -1) {
-      setGhStatus('连接成功，但 @' + u.login + ' 不在管理员名单中', 'error');
-    } else {
-      setGhStatus('连接成功：' + (u.name || u.login) + '（@' + u.login + '）', 'ok');
-    }
+    setGhStatus('连接成功：' + (u.name || u.login) + '（@' + u.login + '）', 'ok');
   } catch (e) {
     setGhStatus('连接失败：' + e.message, 'error');
   } finally {
@@ -889,7 +994,6 @@ async function saveSettings() {
   settings.desc = $('set-desc').value.trim();
   ghConfig.owner = $('gh-owner-input').value.trim();
   ghConfig.repo = $('gh-repo-input').value.trim();
-  ghConfig.admins = $('gh-admins-input').value.trim();
   if (tokenChanged) {
     ghConfig.token = newToken;
     try {
@@ -1063,6 +1167,7 @@ function mdToHtml(md) {
 async function init() {
   loadGhConfig();
   loadLegacySettingsDefaults();
+  unlocked = localStorage.getItem(UNLOCK_KEY) === '1';
   $('footer-year').textContent = new Date().getFullYear();
   if (ghConfig.token) {
     try { await tryLogin(); }
