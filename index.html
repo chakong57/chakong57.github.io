@@ -295,7 +295,9 @@ dialog::backdrop{background:rgba(31,35,40,.5)}
       <div class="dialog-actions" style="justify-content:flex-start">
         <button class="btn btn-sm" id="btn-test-conn" onclick="testConnection()">测试连接</button>
       </div>
-      <p class="hint">此设置页受管理员密码保护。Token 创建：GitHub → Settings → Developer settings → Personal access tokens → 选择 Fine-grained，仅授权本博客仓库，权限勾选 Contents: Read and write。<br>
+      <p class="hint">此设置页受管理员密码保护。<br>
+      方式一（Fine-grained）：GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → ① Repository access 勾选博客仓库；② Contents 权限选 Read and write。<br>
+      方式二（Classic，简单直接）：打开 https://github.com/settings/tokens → Generate new token (classic) → 仓库公开勾选 public_repo、仓库私有勾选 repo → 生成后复制粘贴到上方。<br>
       Token 只保存在「当前浏览器」中，游客看不到也用不了；请勿泄露，泄露等于交出仓库写权限。</p>
     </div>
 
@@ -349,7 +351,8 @@ var UNLOCK_KEY = 'xcom57blog:unlock:v1';
 var ADMIN_PASSWORD_HASH = '6b9b7475b10146c71fd08f21ae181fd2a53d48d67d16090345eba2e548cebefa'; /* 管理员密码 SHA-256（明文不存于页面） */
 var editingId = null;        /* 正在编辑的文章 id */
 var currentPostId = null;    /* 当前查看的文章 id */
-var cloudState = 'loading';  /* loading | ok | error */
+var cloudState = 'loading';  /* loading | ok | empty | error */
+var ghRepoInfo = null;       /* 仓库真实信息 {full_name, private, default_branch, permissions} */
 var flashTimer = null;
 
 function $(id) { return document.getElementById(id); }
@@ -373,6 +376,21 @@ function ghApi(path, opts, tokenOverride) {
       return data;
     });
   });
+}
+
+/* 把常见的 GitHub API 错误翻译成可操作的中文提示 */
+function friendlyGitHubError(e) {
+  var msg = e.message || String(e);
+  if (msg.indexOf('Resource not accessible by personal access token') !== -1) {
+    return 'Token 无权写入仓库「' + (ghConfig.owner || '?') + '/' + (ghConfig.repo || '?') + '」：Fine-grained Token 需勾选该仓库且 Contents 为 Read and write；或改用 Classic Token（勾选 public_repo / repo）';
+  }
+  if (msg.indexOf('Bad credentials') !== -1) {
+    return 'Token 无效或已过期，请重新生成 Token 并保存';
+  }
+  if (msg.indexOf('Not Found') !== -1 || msg.indexOf('404') !== -1) {
+    return '仓库不存在或 Token 无权查看：请检查 GitHub 用户名与仓库名拼写是否正确';
+  }
+  return msg;
 }
 
 /* ================= 配置存储 ================= */
@@ -427,7 +445,26 @@ function logout() {
 
 /* ================= 云端数据读写 ================= */
 
+/* 获取仓库真实信息（处理仓库改名的重定向，结果缓存） */
+async function ensureRepoInfo() {
+  if (ghRepoInfo) return ghRepoInfo;
+  if (!ghConfig.owner || !ghConfig.repo) throw new Error('请先在设置中配置仓库');
+  var r = await ghApi('/repos/' + encodeURIComponent(ghConfig.owner) + '/' + encodeURIComponent(ghConfig.repo));
+  ghRepoInfo = {
+    full_name: r.full_name || (ghConfig.owner + '/' + ghConfig.repo),
+    private: !!r.private,
+    default_branch: r.default_branch || 'HEAD',
+    permissions: r.permissions || {}
+  };
+  return ghRepoInfo;
+}
+
+function repoFullName() {
+  return ghRepoInfo ? ghRepoInfo.full_name : (ghConfig.owner + '/' + ghConfig.repo);
+}
+
 /* 读取仓库根目录 posts.json：优先本站静态文件，回退 raw.githubusercontent.com */
+/* 返回 null 表示云端还没有 posts.json（首次使用）；网络错误则抛出 */
 async function fetchCloudPosts() {
   var data = null;
   try {
@@ -435,12 +472,14 @@ async function fetchCloudPosts() {
     if (res.ok) data = await res.json();
   } catch (e) { /* 继续尝试 raw */ }
   if (!data && ghConfig.owner && ghConfig.repo) {
-    var rawUrl = 'https://raw.githubusercontent.com/' + encodeURIComponent(ghConfig.owner)
-      + '/' + encodeURIComponent(ghConfig.repo) + '/HEAD/posts.json';
-    var r2 = await fetch(rawUrl, { cache: 'no-store' });
-    if (r2.ok) data = await r2.json();
+    var parts = repoFullName().split('/');
+    var rawUrl = 'https://raw.githubusercontent.com/' + encodeURIComponent(parts[0])
+      + '/' + encodeURIComponent(parts[1]) + '/HEAD/posts.json';
+    try {
+      var r2 = await fetch(rawUrl, { cache: 'no-store' });
+      if (r2.ok) data = await r2.json();
+    } catch (e2) { throw new Error('无法连接云端，请检查网络'); }
   }
-  if (!data) throw new Error('云端暂无文章或网络不可用');
   return data;
 }
 
@@ -449,9 +488,14 @@ async function loadCloud() {
   renderHome();
   try {
     var data = await fetchCloudPosts();
-    posts = (data.posts || []).slice();
-    settings = Object.assign({ title: 'My Blog', desc: '' }, data.site || {});
-    cloudState = 'ok';
+    if (data) {
+      posts = (data.posts || []).slice();
+      settings = Object.assign({ title: 'My Blog', desc: '' }, data.site || {});
+      cloudState = 'ok';
+    } else {
+      posts = [];
+      cloudState = 'empty'; /* 云端还没有数据，允许首次发布 */
+    }
   } catch (e) {
     posts = [];
     cloudState = 'error';
@@ -460,22 +504,40 @@ async function loadCloud() {
   renderHome();
 }
 
-/* 把 {site, posts} 整体写入仓库 posts.json（带 sha 条件更新，冲突自动重试） */
+/* 把 {site, posts} 整体写入仓库 posts.json（带 sha 条件更新，冲突自动重试）
+   防覆盖保护：若页面未成功加载云端数据，则先与云端文章按 id 合并再写入，避免误删 */
 async function publishAll(message) {
   if (!ghUser) throw new Error('请先以管理员身份登录');
   if (!ghConfig.owner || !ghConfig.repo) throw new Error('请先在设置中配置仓库');
-  var json = JSON.stringify({ site: settings, updatedAt: Date.now(), posts: posts }, null, 2);
-  var content = btoa(unescape(encodeURIComponent(json))); /* UTF-8 安全 base64 */
-  var path = '/repos/' + encodeURIComponent(ghConfig.owner) + '/' + encodeURIComponent(ghConfig.repo) + '/contents/posts.json';
+  var info = await ensureRepoInfo();
+  var path = '/repos/' + encodeURIComponent(info.full_name) + '/contents/posts.json';
   var attempts = 0;
   while (true) {
     var sha = null;
+    var cloudPosts = null;
     try {
       var cur = await ghApi(path);
       sha = cur.sha;
+      if (cur.content) {
+        try {
+          var decoded = JSON.parse(decodeURIComponent(escape(atob(cur.content))));
+          if (Array.isArray(decoded.posts)) cloudPosts = decoded.posts;
+        } catch (e2) { /* 云端文件内容异常则忽略 */ }
+      }
     } catch (e) {
       if (e.status !== 404) throw e; /* 404 = 文件还不存在，正常 */
     }
+    /* 未成功加载云端时的安全合并：内存为准，云端独有的文章保留，按时间倒序 */
+    if (cloudState !== 'ok' && cloudPosts && cloudPosts.length) {
+      var byId = {};
+      posts.forEach(function (p) { byId[p.id] = 1; });
+      cloudPosts.forEach(function (p) {
+        if (!byId[p.id]) { posts.push(p); byId[p.id] = 1; }
+      });
+      posts.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
+    }
+    var json = JSON.stringify({ site: settings, updatedAt: Date.now(), posts: posts }, null, 2);
+    var content = btoa(unescape(encodeURIComponent(json))); /* UTF-8 安全 base64 */
     try {
       var body = { message: message || '更新博客', content: content };
       if (sha) body.sha = sha;
@@ -617,7 +679,7 @@ async function savePost() {
     flash('已发布到 GitHub！GitHub Pages 约 1 分钟后自动更新');
     openPost(editingId);
   } catch (e) {
-    flash('发布失败：' + e.message + '（请检查网络与 Token 权限）', 'error');
+    flash('发布失败：' + friendlyGitHubError(e), 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;
@@ -656,7 +718,7 @@ async function deletePost(id) {
     flash('文章已删除并同步到 GitHub');
     renderHome();
   } catch (e) {
-    flash('删除失败：' + e.message, 'error');
+    flash('删除失败：' + friendlyGitHubError(e), 'error');
     renderHome();
   }
 }
@@ -689,11 +751,11 @@ async function handleFiles(files) {
         ? await fileToDataUrl(f)
         : await compressImage(f);
       var name = await uploadImageToGitHub(dataUrl, f.type);
-      insertAtCursor('\n![图片](/assets/' + name + ')\n');
+      insertAtCursor('\n![图片](assets/' + name + ')\n');
     }
     flash('图片已上传到 GitHub 并插入正文');
   } catch (e) {
-    flash('图片上传失败：' + e.message, 'error');
+    flash('图片上传失败：' + friendlyGitHubError(e), 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;
@@ -739,12 +801,12 @@ function compressImage(file) {
 }
 
 async function uploadImageToGitHub(dataUrl, mime) {
-  if (!ghConfig.owner || !ghConfig.repo) throw new Error('请先在设置中配置仓库');
+  var info = await ensureRepoInfo();
   var extMap = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
   var ext = extMap[mime] || 'png';
   var name = 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext;
   var base64 = dataUrl.split(',')[1];
-  var path = '/repos/' + encodeURIComponent(ghConfig.owner) + '/' + encodeURIComponent(ghConfig.repo)
+  var path = '/repos/' + encodeURIComponent(info.full_name)
     + '/contents/assets/' + name;
   await ghApi(path, {
     method: 'PUT',
@@ -807,7 +869,7 @@ async function handleImport(input) {
     applySettings();
     renderHome();
   } catch (e) {
-    flash('导入失败：' + e.message, 'error');
+    flash('导入失败：' + friendlyGitHubError(e), 'error');
   }
 }
 
@@ -835,7 +897,7 @@ async function migrateLegacy() {
     renderHome();
     flash('已迁移 ' + added.length + ' 篇文章到 GitHub');
   } catch (e) {
-    flash('迁移失败：' + e.message, 'error');
+    flash('迁移失败：' + friendlyGitHubError(e), 'error');
   }
 }
 
@@ -972,15 +1034,25 @@ function setGhStatus(text, kind) {
 
 async function testConnection() {
   var token = $('gh-token-input').value.trim();
+  var owner = $('gh-owner-input').value.trim();
+  var repo = $('gh-repo-input').value.trim();
   var btn = $('btn-test-conn');
   if (!token) { setGhStatus('请输入 Token', 'error'); return; }
+  if (!owner || !repo) { setGhStatus('请先填写 GitHub 用户名和仓库名', 'error'); return; }
   btn.disabled = true;
   btn.textContent = '测试中…';
   try {
     var u = await ghApi('/user', {}, token);
-    setGhStatus('连接成功：' + (u.name || u.login) + '（@' + u.login + '）', 'ok');
+    var r = await ghApi('/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo), {}, token);
+    var pushOk = !!(r.permissions && r.permissions.push);
+    var fullName = r.full_name || (owner + '/' + repo);
+    if (!pushOk) {
+      setGhStatus('账号 ' + (u.name || u.login) + '（@' + u.login + '）可连接，但该 Token 对仓库「' + fullName + '」只有只读权限，无法发布文章和上传图片，请改用有写权限的 Token（Classic 勾选 public_repo / repo）', 'error');
+    } else {
+      setGhStatus('连接成功：' + (u.name || u.login) + '（@' + u.login + '），Token 可读写仓库「' + fullName + '」', 'ok');
+    }
   } catch (e) {
-    setGhStatus('连接失败：' + e.message, 'error');
+    setGhStatus(friendlyGitHubError(e), 'error');
   } finally {
     btn.disabled = false;
     btn.textContent = '测试连接';
@@ -994,6 +1066,7 @@ async function saveSettings() {
   settings.desc = $('set-desc').value.trim();
   ghConfig.owner = $('gh-owner-input').value.trim();
   ghConfig.repo = $('gh-repo-input').value.trim();
+  ghRepoInfo = null; /* 仓库信息可能变化，重新获取 */
   if (tokenChanged) {
     ghConfig.token = newToken;
     try {
@@ -1013,7 +1086,7 @@ async function saveSettings() {
       await publishAll('更新站点设置');
       msg = '设置已保存并同步到 GitHub';
     } catch (e) {
-      msg = '设置已保存，但同步到 GitHub 失败：' + e.message;
+      msg = '设置已保存，但同步到 GitHub 失败：' + friendlyGitHubError(e);
     }
     await loadCloud();
   }
