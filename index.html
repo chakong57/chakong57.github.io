@@ -408,6 +408,9 @@ function friendlyGitHubError(e) {
   if (msg.indexOf('Not Found') !== -1 || msg.indexOf('404') !== -1) {
     return '仓库不存在或 Token 无权查看：请检查 GitHub 用户名与仓库名拼写是否正确';
   }
+  if (msg.indexOf('rate limit') !== -1 || msg.indexOf('API rate limit') !== -1) {
+    return 'GitHub API 配额已用完（rate limit exceeded）。常见原因：Token 未正确保存，导致请求按「未认证」计费（未认证限流 60 次/小时/IP，共享代理 IP 很容易耗尽）。请打开设置页确认显示「已连接：@你的账号」，然后更换代理节点或等待约 1 小时；Token 有效后认证请求不受此限制';
+  }
   return msg;
 }
 
@@ -1067,7 +1070,20 @@ async function testConnection() {
     if (!pushOk) {
       setGhStatus('账号 ' + (u.name || u.login) + '（@' + u.login + '）可连接，但该 Token 对仓库「' + fullName + '」只有只读权限，无法发布文章和上传图片，请改用有写权限的 Token（Classic 勾选 public_repo / repo）', 'error');
     } else {
-      setGhStatus('连接成功：' + (u.name || u.login) + '（@' + u.login + '），Token 可读写仓库「' + fullName + '」', 'ok');
+      /* 测试成功：立即自动保存配置，避免用户忘记点「保存」导致 Token 未生效 */
+      ghConfig.owner = owner;
+      ghConfig.repo = repo;
+      ghConfig.token = token;
+      ghRepoInfo = {
+        full_name: fullName,
+        private: !!r.private,
+        default_branch: r.default_branch || 'HEAD',
+        permissions: r.permissions || {}
+      };
+      ghUser = u;
+      saveGhConfig();
+      updateAuthUI();
+      setGhStatus('连接成功：' + (u.name || u.login) + '（@' + u.login + '），Token 可读写仓库「' + fullName + '」，配置已自动保存', 'ok');
     }
   } catch (e) {
     setGhStatus(friendlyGitHubError(e), 'error');
